@@ -61,6 +61,7 @@ import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelId;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.handler.codec.EncoderException;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpContentDecompressor;
@@ -2536,5 +2537,74 @@ public class HttpClientTest {
 
 		assertThat(m.get()).isNotNull();
 		assertThat(m.get().idleSize()).isEqualTo(expectation);
+	}
+
+	/**
+	 * This is a reproducible example for https://github.com/reactor/reactor-pool/issues/118
+	 */
+	@Test
+	void testRetryWithAlreadyReleasedByteBuf() throws Exception {
+		ExecutorService threadPool = Executors.newCachedThreadPool();
+		int serverPort = SocketUtils.findAvailableTcpPort();
+		ConnectionResetByPeerServer server = new ConnectionResetByPeerServer(serverPort);
+		Future<?> serverFuture = threadPool.submit(server);
+		if(!server.await(5, TimeUnit.SECONDS)){
+			throw new IOException("fail to start test server");
+		}
+
+		AtomicReference<ConnectionPoolMetrics> poolMetrics = new AtomicReference<>();
+		ConnectionProvider provider =
+				ConnectionProvider.builder("testRetryWithAlreadyReleasedByteBuf")
+				                  .maxConnections(1)
+				                  .metrics(true, () -> (name, id, address, metrics) -> poolMetrics.set(metrics))
+				                  .build();
+
+		try {
+			HttpClient client =
+					HttpClient.create(provider)
+					          .port(serverPort)
+					          .wiretap(true);
+
+			// The first request fails with "Connection reset by peer".
+			// The request will be retried.
+			// The ByteBuf was released with the first request, so when a retry
+			// is attempted because the ByteBuf is not retained, IllegalReferenceCountException
+			// will be thrown.
+			ByteBuf buf = Unpooled.wrappedBuffer("test1".getBytes(Charset.defaultCharset()));
+
+			StepVerifier.create(client.post()
+			                          .uri("/")
+			                          .send(Mono.just(buf))
+			                          .responseContent())
+			            .expectError(EncoderException.class)
+			            .verify(Duration.ofSeconds(5));
+
+			assertThat(poolMetrics.get()).isNotNull();
+			assertThat(poolMetrics.get().idleSize()).isEqualTo(1);
+			assertThat(poolMetrics.get().acquiredSize()).isEqualTo(0);
+
+			// Make another request to be sure that the connection in the pool can be acquired
+			// The ByteBuf is always created when sending to the server
+			StepVerifier.create(client.post()
+			                          .uri("/")
+			                          .send(Mono.just(Unpooled.wrappedBuffer("test2".getBytes(Charset.defaultCharset()))))
+			                          .responseContent())
+			            .expectError(PrematureCloseException.class)
+			            .verify(Duration.ofSeconds(5));
+
+			assertThat(poolMetrics.get()).isNotNull();
+			assertThat(poolMetrics.get().idleSize()).isEqualTo(0);
+			assertThat(poolMetrics.get().acquiredSize()).isEqualTo(0);
+		}
+		finally {
+			server.close();
+			assertThat(serverFuture.get()).isNull();
+
+			threadPool.shutdown();
+			assertThat(threadPool.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+
+			provider.disposeLater()
+			        .block(Duration.ofSeconds(5));
+		}
 	}
 }
